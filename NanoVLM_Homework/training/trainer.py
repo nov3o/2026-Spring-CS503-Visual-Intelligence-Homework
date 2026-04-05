@@ -137,6 +137,10 @@ def train(train_cfg, vlm_cfg, is_distributed=False, rank=0, world_size=1, local_
         total_tokens_processed = 0
 
         optimizer.zero_grad()
+        # Sum micro-batch stats; log to wandb once per optimizer step (avoids duplicate step= keys when grad acc > 1).
+        accum_batch_loss = 0.0
+        accum_tokens_per_sec = 0.0
+        accum_log_steps = 0
         for i, batch in enumerate(train_loader):
             batch_start_time = time.time()
             images = batch["image"].to(device)
@@ -205,9 +209,12 @@ def train(train_cfg, vlm_cfg, is_distributed=False, rank=0, world_size=1, local_
                         print(
                             f"Step: {global_step}, Loss: {total_train_loss/max(1, i):.4f}, Val Loss: {avg_val_loss:.4f}, Accuracy: {epoch_accuracy:.4f}"
                         )
-                    if train_cfg.log_wandb:
+                    if train_cfg.log_wandb and run is not None:
                         run.log(
-                            {"accuracy": epoch_accuracy, "val_loss": avg_val_loss},
+                            {
+                                "eval/accuracy": epoch_accuracy,
+                                "eval/val_loss": avg_val_loss,
+                            },
                             step=global_step,
                         )
 
@@ -251,6 +258,13 @@ def train(train_cfg, vlm_cfg, is_distributed=False, rank=0, world_size=1, local_
             )
             total_tokens_processed += num_tokens
 
+            batch_end_time = time.time()
+            tokens_per_second = num_tokens / (batch_end_time - batch_start_time)
+
+            accum_batch_loss += batch_loss
+            accum_tokens_per_sec += tokens_per_second
+            accum_log_steps += 1
+
             if (i + 1) % train_cfg.gradient_accumulation_steps == 0 or (i + 1) == len(
                 train_loader
             ):
@@ -263,19 +277,20 @@ def train(train_cfg, vlm_cfg, is_distributed=False, rank=0, world_size=1, local_
                 optimizer.zero_grad()
                 global_step += 1
 
-            batch_end_time = time.time()
-            tokens_per_second = num_tokens / (batch_end_time - batch_start_time)
-
-            if rank == 0 and train_cfg.log_wandb:
-                run.log(
-                    {
-                        "batch_loss": batch_loss,
-                        "tokens_per_second": tokens_per_second,
-                        "lr_mp": optimizer.param_groups[0]["lr"],
-                        "lr_backbones": optimizer.param_groups[1]["lr"],
-                    },
-                    step=global_step,
-                )
+                if rank == 0 and train_cfg.log_wandb:
+                    run.log(
+                        {
+                            "train/batch_loss": accum_batch_loss / accum_log_steps,
+                            "train/tokens_per_second": accum_tokens_per_sec
+                            / accum_log_steps,
+                            "train/lr_mp": optimizer.param_groups[0]["lr"],
+                            "train/lr_backbones": optimizer.param_groups[1]["lr"],
+                        },
+                        step=global_step,
+                    )
+                accum_batch_loss = 0.0
+                accum_tokens_per_sec = 0.0
+                accum_log_steps = 0
 
         avg_train_loss = total_train_loss / len(train_loader)
         if is_distributed:
@@ -293,10 +308,11 @@ def train(train_cfg, vlm_cfg, is_distributed=False, rank=0, world_size=1, local_
             if run is not None:
                 run.log(
                     {
-                        "epoch_loss": avg_train_loss,
-                        "epoch_duration": epoch_duration,
-                        "epoch_tokens_per_second": epoch_tokens_per_second,
-                    }
+                        "epoch/loss": avg_train_loss,
+                        "epoch/duration_s": epoch_duration,
+                        "epoch/tokens_per_second": epoch_tokens_per_second,
+                    },
+                    step=global_step,
                 )
 
             print(

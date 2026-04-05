@@ -133,7 +133,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             padding_mask = (attn_bias == 0).transpose(-1, -2)
             attn_bias = (1.0 - attn_bias) * torch.finfo(q.dtype).min
 
-        if self.sdpa:
+        if self.sdpa and attn_bias is None:
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_bias,
